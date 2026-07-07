@@ -205,9 +205,15 @@ class IsaacSimEmbodiment:
         if self._env is not None:
             return self._env
         self._ensure_app()
-        # Importing the tasks registers the gym ids; must happen AFTER the app boots.
-        import gymnasium as gym
-        import isaaclab_tasks  # noqa: F401  (registers Isaac-* gym ids)
+        try:
+            # Importing the tasks registers the gym ids; must happen AFTER the
+            # app boots. gymnasium isn't a declared plugin dependency (it rides
+            # in with isaaclab), so a partial/broken Isaac install must still
+            # surface the curated error, not a raw ImportError.
+            import gymnasium as gym
+            import isaaclab_tasks  # noqa: F401  (registers Isaac-* gym ids)
+        except ImportError as exc:  # pragma: no cover - exercised only without Isaac
+            raise _missing_isaac(exc) from exc
 
         self._env = gym.make(self.task_id, num_envs=1, render_mode="rgb_array")
         return self._env
@@ -229,7 +235,7 @@ class IsaacSimEmbodiment:
         ).reshape(1, -1)
         obs, reward, terminated, truncated, info = env.step(tensor)
 
-        success = self._read_success(info, terminated)
+        success = self._read_success(info)
         term = bool(_scalar(terminated))
         return StepResult(
             observation=self._to_observation(obs, None),
@@ -288,11 +294,15 @@ class IsaacSimEmbodiment:
 
         return Observation(images=images, state=state, instruction=instruction)
 
-    def _read_success(self, info: Any, terminated: Any) -> bool:
+    def _read_success(self, info: Any) -> bool:
         if isinstance(info, Mapping) and self.success_info_key in info:
             return bool(_scalar(info[self.success_info_key]))
-        # Fall back to "terminated implies success" when the task exposes no oracle.
-        return bool(_scalar(terminated))
+        # A task can terminate on failure too (a dropped object, an
+        # out-of-bounds pose) — termination alone is not evidence of success.
+        # With no oracle in `info`, the honest answer is "not known to have
+        # succeeded", not "assume it succeeded" (previously: `terminated
+        # implies success`, which scored every failure termination as a win).
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -323,5 +333,10 @@ def _to_image(value: Any) -> np.ndarray:
     if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
         arr = np.transpose(arr, (1, 2, 0))  # CHW -> HWC
     if np.issubdtype(arr.dtype, np.floating):
-        arr = np.clip(arr * 255.0 if arr.max() <= 1.0 else arr, 0, 255)
+        # Isaac Lab's rgb_array render mode returns normalized [0, 1] float
+        # images; scale unconditionally rather than guessing from arr.max()
+        # <= 1.0, which misclassifies a legitimately dark frame (all pixels
+        # already < 1.0 despite being in the [0, 255] range) as "already
+        # scaled", and raises on an empty array (`arr.max()` has no identity).
+        arr = np.clip(arr * 255.0, 0, 255)
     return arr.astype(np.uint8)

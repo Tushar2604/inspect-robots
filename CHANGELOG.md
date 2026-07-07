@@ -20,6 +20,18 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **isaacsim plugin: a task terminating without a success oracle is no longer
+  scored as a success.** `IsaacSimEmbodiment._read_success` previously fell
+  back to "terminated implies success" when a task exposed no
+  `success_info_key`, so a failure termination (dropped object,
+  out-of-bounds) was recorded as `termination_reason="success"`; it now
+  correctly returns "not known to have succeeded" (#5). The plugin also
+  wraps its `gymnasium`/`isaaclab_tasks` import in the same curated
+  `RuntimeError` as the rest of Isaac bring-up instead of a raw `ImportError`,
+  and `_to_image`'s float→uint8 conversion always scales the normalized
+  `[0, 1]` frames Isaac Lab returns instead of guessing from `arr.max()`
+  (which misclassified legitimately dark frames and crashed on an empty
+  array).
 - **Eval logs are strict RFC 8259 JSON.** Non-finite floats (e.g. an inf
   `min_distance_to_goal` when no distance was ever recorded) are mapped to
   `null` at the JSON boundary, so `jq` and other conforming parsers accept the

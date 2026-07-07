@@ -124,6 +124,21 @@ def test_reset_without_isaac_raises_clear_error() -> None:
         emb.reset(Scene(id="s0", instruction="lift the cube"))
 
 
+def test_ensure_env_raises_clear_error_when_gymnasium_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for #5: gymnasium isn't a declared plugin dependency (it rides
+    # in with isaaclab) and was imported unguarded, so a partial Isaac install
+    # missing it surfaced a raw ImportError instead of the curated message.
+    import sys
+
+    emb = IsaacSimEmbodiment()
+    monkeypatch.setattr(emb, "_ensure_app", lambda: None)
+    monkeypatch.setitem(sys.modules, "gymnasium", None)
+    with pytest.raises(RuntimeError, match="Isaac Sim / Isaac Lab is not importable"):
+        emb._ensure_env()
+
+
 def test_close_is_safe_before_launch_and_idempotent() -> None:
     emb = IsaacSimEmbodiment()
     emb.close()  # no env/app yet -> no-op, must not raise
@@ -209,6 +224,71 @@ def test_step_translation_against_fake_env() -> None:
     assert {"joint_pos", "eef_pos", "gripper"} <= set(result.observation.state)
     assert result.terminated is False
     assert result.info["success"] is False
+
+
+class _FakeEnvTerminatesWithoutSuccessKey(_FakeIsaacEnv):
+    """A task that terminates (e.g. a dropped object) but exposes no success oracle."""
+
+    def step(self, action: Any) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
+        self.step_calls += 1
+        return self._obs(), np.array([0.0]), np.array([True]), np.array([False]), {}
+
+
+def test_terminated_without_success_key_is_not_scored_as_success() -> None:
+    # Regression for #5: a task can terminate on failure (dropped object,
+    # out-of-bounds) as well as success. With no `success_info_key` in info,
+    # the adapter must not assume termination == success.
+    from inspect_robots import Action
+
+    emb = IsaacSimEmbodiment()
+    fake = _FakeEnvTerminatesWithoutSuccessKey(emb.info.action_space.dim)
+    emb._env = fake
+    emb._torch = _FakeTorch()
+    emb.reset(Scene(id="s", instruction="lift"))
+    result = emb.step(Action(data=np.zeros(8)))
+    assert result.terminated is True
+    assert result.termination_reason is None
+    assert result.info["success"] is False
+
+
+# --------------------------------------------------------------------------- #
+# _to_image: float -> uint8 conversion (regression coverage for #5).
+# --------------------------------------------------------------------------- #
+def test_to_image_scales_normalized_float_frame() -> None:
+    from inspect_robots_isaacsim.embodiment import _to_image
+
+    # 2x2 so shape[0] != 1 (avoids the num_envs-drop branch); normalized [0, 1].
+    arr = np.array(
+        [[[0.0, 0.5, 1.0], [0.0, 0.5, 1.0]], [[0.0, 0.5, 1.0], [0.0, 0.5, 1.0]]],
+        dtype=np.float32,
+    )
+    img = _to_image(arr)
+    assert img.dtype == np.uint8
+    assert img.shape == (2, 2, 3)
+    assert img[0, 0].tolist() == [0, 127, 255]
+
+
+def test_to_image_scales_dark_float_frame_consistently() -> None:
+    # Regression for #5: a legitimately dark, normalized frame (every pixel
+    # near-black, so arr.max() <= 1.0) must still be scaled by 255 like any
+    # other normalized frame — not left un-scaled by a max()-based guess.
+    from inspect_robots_isaacsim.embodiment import _to_image
+
+    dark = np.full((2, 2, 3), 0.004, dtype=np.float32)
+    img = _to_image(dark)
+    assert img.dtype == np.uint8
+    assert (img == 1).all()  # 0.004 * 255 ~= 1.02 -> 1, not left as raw 0.004 -> 0
+
+
+def test_to_image_handles_empty_array_without_crashing() -> None:
+    # Regression for #5: arr.max() on an empty array used to raise
+    # ValueError("zero-size array to reduction operation maximum...").
+    from inspect_robots_isaacsim.embodiment import _to_image
+
+    empty = np.zeros((0, 4, 3), dtype=np.float32)
+    img = _to_image(empty)
+    assert img.dtype == np.uint8
+    assert img.shape == (0, 4, 3)
 
 
 def test_no_ram_leak_over_many_steps() -> None:
